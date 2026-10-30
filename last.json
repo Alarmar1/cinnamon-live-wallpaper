@@ -1,5 +1,6 @@
 {
-  "wall_id": "1470512742",
+  "wall_id": "827246331",
   "fps": 30,
-  "volume": 0
+  "volume": 100,
+  "pause_on_windows": true
 }

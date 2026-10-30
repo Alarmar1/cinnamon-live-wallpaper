@@ -12,8 +12,9 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Wnck", "3.0")
 gi.require_version("XApp", "1.0")
-from gi.repository import GdkPixbuf, GLib, Gtk, XApp  # noqa: E402
+from gi.repository import GdkPixbuf, GLib, Gtk, Wnck, XApp  # noqa: E402
 
 WORKSHOP_DIR = Path.home() / ".steam/steam/steamapps/workshop/content/431960"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -22,6 +23,8 @@ STATE_FILE = SCRIPT_DIR / "last.json"
 THUMB_SIZE = 48
 DEFAULT_FPS = 30
 DEFAULT_VOLUME = 10
+
+WALLPAPER_PROC = "linux-wallpaper"  # имя процесса обоев (для pkill)
 
 
 def find_preview(folder: Path) -> Path | None:
@@ -73,9 +76,46 @@ def load_state() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_state(wall_id: str, fps: int, volume: int) -> None:
-    payload = {"wall_id": wall_id, "fps": fps, "volume": volume}
+def save_state(wall_id: str, fps: int, volume: int, pause_on_windows: bool) -> None:
+    payload = {"wall_id": wall_id, "fps": fps, "volume": volume, "pause_on_windows": pause_on_windows}
     STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+class WindowWatcher:
+    """
+    Мониторинг окон (развернутые/полноэкранные) через Wnck, X11.
+    Логика по мотивам WindowHandler из Hidamari (utils.py).
+    При изменении состояния вызывает on_busy(True/False).
+    """
+
+    def __init__(self, on_busy: callable) -> None:
+        self.on_busy = on_busy
+        self.prev_busy: bool | None = None
+        self.screen = Wnck.Screen.get_default()
+        self.screen.force_update()
+        self.screen.connect("window-opened", self._window_opened, None)
+        self.screen.connect("window-closed", self._eval, None)
+        self.screen.connect("active-workspace-changed", self._eval, None)
+        for window in self.screen.get_windows():
+            window.connect("state-changed", self._eval, None)
+        self._eval()
+
+    def _window_opened(self, screen: Wnck.Screen, window: Wnck.Window, _user) -> None:
+        window.connect("state-changed", self._eval, None)
+        self._eval()
+
+    def _eval(self, *args) -> None:
+        busy = False
+        workspace = self.screen.get_active_workspace()
+        for window in self.screen.get_windows():
+            if Wnck.Window.is_minimized(window) or not Wnck.Window.is_on_workspace(window, workspace):
+                continue
+            if Wnck.Window.is_maximized(window) or Wnck.Window.is_fullscreen(window):
+                busy = True
+                break
+        if busy != self.prev_busy:
+            self.prev_busy = busy
+            self.on_busy(busy)
 
 
 class App(Gtk.Window):
@@ -87,6 +127,7 @@ class App(Gtk.Window):
 
         self.wallpapers: list[tuple[str, str, Path | None]] = []
         self._busy = False
+        self.watcher: WindowWatcher | None = None
         self._empty_thumb = GdkPixbuf.Pixbuf.new(
             GdkPixbuf.Colorspace.RGB, True, 8, THUMB_SIZE, THUMB_SIZE
         )
@@ -158,6 +199,10 @@ class App(Gtk.Window):
         vol_row.pack_start(self.volume_scale, True, True, 0)
         vol_row.pack_start(self.volume_value, False, False, 0)
         controls.attach(vol_row, 1, 1, 1, 1)
+
+        self.pause_check = Gtk.CheckButton(label="Останавливать при открытии окон")
+        self.pause_check.connect("toggled", self._on_pause_toggled)
+        controls.attach(self.pause_check, 0, 2, 2, 1)
         root.pack_start(controls, False, False, 0)
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -228,6 +273,8 @@ class App(Gtk.Window):
             volume = max(0, min(100, int(round(volume))))
             self.volume_scale.set_value(volume)
             self.volume_value.set_text(str(volume))
+        if state.get("pause_on_windows"):
+            self.pause_check.set_active(True)
 
         return bool(wall_id) and self._select_id(wall_id)
 
@@ -239,6 +286,38 @@ class App(Gtk.Window):
 
     def _on_volume_changed(self, scale: Gtk.Scale) -> None:
         self.volume_value.set_text(str(int(round(scale.get_value()))))
+
+    def _on_pause_toggled(self, button: Gtk.CheckButton) -> None:
+        if button.get_active():
+            self.watcher = WindowWatcher(self._on_windows_busy)
+        else:
+            if self.watcher is not None:
+                self.watcher.on_busy = None
+                self.watcher = None
+            self._resume_wallpaper()
+        self._persist()
+
+    def _persist(self) -> None:
+        item = self._selected()
+        wall_id = item[1] if item else ""
+        fps = self._fps() or DEFAULT_FPS
+        volume = int(round(self.volume_scale.get_value()))
+        save_state(wall_id, fps, volume, self.pause_check.get_active())
+
+    def _on_windows_busy(self, busy: bool) -> None:
+        if busy:
+            self._pause_wallpaper()
+        else:
+            self._resume_wallpaper()
+
+    @staticmethod
+    def _pause_wallpaper() -> None:
+        os.system(f"pkill -STOP -x {WALLPAPER_PROC}")
+
+    @staticmethod
+    def _resume_wallpaper() -> None:
+        # SIGCONT даже новым процессам не вредит, они просто не остановлены
+        os.system(f"pkill -CONT -x {WALLPAPER_PROC}")
 
     def _fps(self) -> int | None:
         raw = self.fps_entry.get_text().strip()
@@ -257,7 +336,7 @@ class App(Gtk.Window):
             return
         _title, wall_id = item
         volume = int(round(self.volume_scale.get_value()))
-        save_state(wall_id, fps, volume)
+        save_state(wall_id, fps, volume, self.pause_check.get_active())
         self._run_script(wall_id, fps, volume)
 
     def fix_icons(self) -> None:
@@ -319,6 +398,7 @@ class App(Gtk.Window):
         self.present()
 
     def _quit_app(self, *_args) -> None:
+        self._resume_wallpaper()
         os.system("pkill -x linux-wallpaper")
         Gtk.main_quit()
 
